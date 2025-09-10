@@ -115,3 +115,8 @@ This tool targets the current latest public release for Messages.app. It may wor
   - On startup:
     - Different handles that belong to the same person are combined
     - Chatrooms that contain identical contacts (i.e., duplicated handles) are combined
+- Announcements
+  - Handles all types of chatroom announcements
+    - Group photo changes
+    - Chat participant modifications
+    - Chat background settings
