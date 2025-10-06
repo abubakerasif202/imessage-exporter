@@ -4,19 +4,8 @@
 
 use std::{
     fmt::Display,
-    fs::{create_dir_all, metadata, write},
+    fs::{create_dir_all, remove_file, write},
     path::{Path, PathBuf},
-};
-
-use crate::app::{
-    compatibility::{
-        converters::{
-            audio::audio_copy_convert, common::copy_raw, image::image_copy_convert,
-            sticker::sticker_copy_convert, video::video_copy_convert,
-        },
-        models::{AudioConverter, Converter, ImageConverter, VideoConverter},
-    },
-    runtime::Config,
 };
 
 use imessage_database::{
@@ -27,14 +16,29 @@ use imessage_database::{
     },
 };
 
-use filetime::{set_file_times, FileTime};
+use crate::app::{
+    compatibility::{
+        backup::decrypt_file,
+        converters::{
+            audio::audio_copy_convert,
+            common::{copy_raw, update_file_metadata},
+            image::image_copy_convert,
+            sticker::sticker_copy_convert,
+            video::video_copy_convert,
+        },
+        models::{AudioConverter, Converter, HardwareEncoder, ImageConverter, VideoConverter},
+    },
+    runtime::Config,
+};
 
+// MARK: Manager
 #[derive(Debug, PartialEq, Eq, Default)]
 pub struct AttachmentManager {
     pub mode: AttachmentManagerMode,
     pub image_converter: Option<ImageConverter>,
     pub audio_converter: Option<AudioConverter>,
     pub video_converter: Option<VideoConverter>,
+    hardware_encoder: Option<HardwareEncoder>,
 }
 
 impl AttachmentManager {
@@ -44,6 +48,7 @@ impl AttachmentManager {
             image_converter: ImageConverter::determine(),
             audio_converter: AudioConverter::determine(),
             video_converter: VideoConverter::determine(),
+            hardware_encoder: HardwareEncoder::detect(),
         }
     }
 }
@@ -71,6 +76,7 @@ impl AttachmentManager {
         }
     }
 
+    // MARK: Handwriting
     /// Handle a handwriting message, optionally writing it to an SVG file
     pub fn handle_handwriting(
         &self,
@@ -97,18 +103,17 @@ impl AttachmentManager {
             }
 
             // Ensure the directory tree exists
-            if let Some(folder) = to.parent() {
-                if !folder.exists() {
-                    if let Err(why) = create_dir_all(folder) {
-                        eprintln!("Unable to create {folder:?}: {why}");
-                    }
-                }
+            if let Some(folder) = to.parent()
+                && !folder.exists()
+                && let Err(why) = create_dir_all(folder)
+            {
+                eprintln!("Unable to create {folder:?}: {why}");
             }
 
             // Attempt the svg render
             if let Err(why) = write(to.to_str()?, handwriting.render_svg()) {
                 eprintln!("Unable to write to {to:?}: {why}");
-            };
+            }
 
             // Update file metadata
             update_file_metadata(&to, &to, message, config);
@@ -118,6 +123,7 @@ impl AttachmentManager {
         None
     }
 
+    // MARK: Files
     /// Handle an attachment, copying and converting if requested
     ///
     /// If copied, update attachment's `copied_path` and `mime_type`
@@ -127,15 +133,35 @@ impl AttachmentManager {
         attachment: &'a mut Attachment,
         config: &Config,
     ) -> Option<()> {
-        // Resolve the path to the attachment
-        let attachment_path = attachment.resolved_attachment_path(
-            &config.options.platform,
-            &config.options.db_path,
-            config.options.attachment_root.as_deref(),
-        )?;
-
         if !matches!(self.mode, AttachmentManagerMode::Disabled) {
-            let from = Path::new(&attachment_path);
+            // Resolve the path to the attachment
+            let attachment_path = attachment.resolved_attachment_path(
+                &config.options.platform,
+                &config.options.db_path,
+                config.options.attachment_root.as_deref(),
+            )?;
+
+            let mut is_temp = false;
+            let mut from = PathBuf::from(&attachment_path);
+
+            // Handle encrypted files from iOS backups
+            if let Some(backup) = &config.backup {
+                // We shouldn't get here without an encrypted backup, but just in case, validate it
+                if backup.is_encrypted() {
+                    match decrypt_file(backup, &from) {
+                        Ok(decrypted_path) => {
+                            // If the decrypted file is different from the original, use the decrypted one
+                            from = decrypted_path;
+                            // The decrypted file is temporary, so we need to remove it later
+                            is_temp = true;
+                        }
+                        Err(why) => {
+                            eprintln!("Unable to decrypt {from:?}: {why}");
+                            return None;
+                        }
+                    }
+                }
+            }
 
             // Ensure the file exists at the specified location
             if !from.exists() {
@@ -153,8 +179,10 @@ impl AttachmentManager {
             // Add a stable filename
             to.push(attachment.rowid.to_string());
 
-            // Set the new file's extension to the original one
-            to.set_extension(attachment.extension()?);
+            // Set the new file's extension to the original one, if provided
+            if !from.is_dir() && attachment.extension().is_some() {
+                to.set_extension(attachment.extension()?);
+            }
 
             // If the same file was referenced more than once, i.e. in a reply or response that we render twice, escape early
             if to.exists() {
@@ -166,49 +194,48 @@ impl AttachmentManager {
             let mut new_media_type: Option<MediaType> = None;
 
             match attachment.mime_type() {
-                MediaType::Image(_) => {
-                    match self.mode {
-                        AttachmentManagerMode::Basic | AttachmentManagerMode::Full => {
-                            match &self.image_converter {
-                                Some(converter) => {
-                                    if attachment.is_sticker {
-                                        new_media_type = sticker_copy_convert(
-                                            from,
-                                            &mut to,
-                                            converter,
-                                            &self.video_converter,
-                                            attachment.mime_type(),
-                                        );
-                                    } else {
-                                        new_media_type = image_copy_convert(
-                                            from,
-                                            &mut to,
-                                            converter,
-                                            attachment.mime_type(),
-                                        );
-                                    }
+                MediaType::Image(_) => match self.mode {
+                    AttachmentManagerMode::Basic | AttachmentManagerMode::Full => {
+                        match &self.image_converter {
+                            Some(converter) => {
+                                if attachment.is_sticker {
+                                    new_media_type = sticker_copy_convert(
+                                        &from,
+                                        &mut to,
+                                        converter,
+                                        &self.video_converter,
+                                        attachment.mime_type(),
+                                    );
+                                } else {
+                                    new_media_type = image_copy_convert(
+                                        &from,
+                                        &mut to,
+                                        converter,
+                                        attachment.mime_type(),
+                                    );
                                 }
-                                None => copy_raw(from, &to),
                             }
+                            None => copy_raw(&from, &to),
                         }
-                        AttachmentManagerMode::Clone => copy_raw(from, &to),
-                        AttachmentManagerMode::Disabled => unreachable!(),
-                    };
-                }
+                    }
+                    AttachmentManagerMode::Clone => copy_raw(&from, &to),
+                    AttachmentManagerMode::Disabled => unreachable!(),
+                },
                 MediaType::Video(_) => match self.mode {
                     AttachmentManagerMode::Full => match &self.video_converter {
                         Some(converter) => {
                             new_media_type = video_copy_convert(
-                                from,
+                                &from,
                                 &mut to,
                                 converter,
+                                &self.hardware_encoder,
                                 attachment.mime_type(),
                             );
                         }
-                        None => copy_raw(from, &to),
+                        None => copy_raw(&from, &to),
                     },
                     AttachmentManagerMode::Clone | AttachmentManagerMode::Basic => {
-                        copy_raw(from, &to)
+                        copy_raw(&from, &to);
                     }
                     AttachmentManagerMode::Disabled => unreachable!(),
                 },
@@ -216,33 +243,46 @@ impl AttachmentManager {
                     AttachmentManagerMode::Full => match &self.audio_converter {
                         Some(converter) => {
                             new_media_type = audio_copy_convert(
-                                from,
+                                &from,
                                 &mut to,
                                 converter,
                                 attachment.mime_type(),
                             );
                         }
-                        None => copy_raw(from, &to),
+                        None => copy_raw(&from, &to),
                     },
                     AttachmentManagerMode::Clone | AttachmentManagerMode::Basic => {
-                        copy_raw(from, &to)
+                        copy_raw(&from, &to);
                     }
                     AttachmentManagerMode::Disabled => unreachable!(),
                 },
-                _ => copy_raw(from, &to),
+                _ => copy_raw(&from, &to),
             }
 
             // Update file metadata
-            update_file_metadata(from, &to, message, config);
+            if is_temp {
+                // If the file was decrypted, we need to update the metadata from the original file
+                update_file_metadata(Path::new(&attachment_path), &to, message, config);
+            } else {
+                // If the file was copied, we need to update the metadata from the source file
+                update_file_metadata(&from, &to, message, config);
+            }
             attachment.copied_path = Some(to);
             if let Some(media_type) = new_media_type {
-                attachment.mime_type = Some(media_type.as_mime_type())
+                attachment.mime_type = Some(media_type.as_mime_type());
+            }
+
+            // Remove the temporary file used for decryption, if it exists
+            if is_temp && let Err(why) = remove_file(&from) {
+                eprintln!("Unable to remove encrypted file {from:?}: {why}");
             }
         }
+
         Some(())
     }
 }
 
+// MARK: Mode
 /// Represents different ways the app can interact with attachment data
 #[derive(Debug, PartialEq, Eq)]
 pub enum AttachmentManagerMode {
@@ -286,21 +326,28 @@ impl Display for AttachmentManagerMode {
     }
 }
 
-/// Update the metadata of a copied file, falling back to the original file's metadata if necessary
-fn update_file_metadata(from: &Path, to: &Path, message: &Message, config: &Config) {
-    // Update file metadata
-    if let Ok(metadata) = metadata(from) {
-        // The modification time is the message's date, otherwise the the original file's creation time
-        let mtime = match message.date(&config.offset) {
-            Ok(date) => FileTime::from_unix_time(date.timestamp(), date.timestamp_subsec_nanos()),
-            Err(_) => FileTime::from_last_modification_time(&metadata),
-        };
+#[cfg(test)]
+mod tests {
+    use crate::app::compatibility::attachment_manager::AttachmentManagerMode;
 
-        // The new last access time comes from the metadata of the original file
-        let atime = FileTime::from_last_access_time(&metadata);
-
-        if let Err(why) = set_file_times(to, atime, mtime) {
-            eprintln!("Unable to update {to:?} metadata: {why}");
-        }
+    #[test]
+    fn test_attachment_manager_mode() {
+        assert_eq!(
+            AttachmentManagerMode::from_cli("disabled"),
+            Some(AttachmentManagerMode::Disabled)
+        );
+        assert_eq!(
+            AttachmentManagerMode::from_cli("basic"),
+            Some(AttachmentManagerMode::Basic)
+        );
+        assert_eq!(
+            AttachmentManagerMode::from_cli("clone"),
+            Some(AttachmentManagerMode::Clone)
+        );
+        assert_eq!(
+            AttachmentManagerMode::from_cli("full"),
+            Some(AttachmentManagerMode::Full)
+        );
+        assert_eq!(AttachmentManagerMode::from_cli("invalid"), None);
     }
 }

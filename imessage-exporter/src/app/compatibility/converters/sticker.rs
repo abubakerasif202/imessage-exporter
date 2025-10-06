@@ -29,33 +29,37 @@ pub(crate) fn sticker_copy_convert(
     // Determine the output type of the sticker
     let output_type: Option<ImageType> = match mime_type {
         // Normal stickers get converted to png
-        MediaType::Image("heic") | MediaType::Image("HEIC") => Some(ImageType::Png),
-        MediaType::Image("heics")
-        | MediaType::Image("HEICS")
-        | MediaType::Image("heic-sequence") => Some(ImageType::Gif),
+        MediaType::Image("heic" | "HEIC") => Some(ImageType::Png),
+        MediaType::Image("heics" | "HEICS" | "heic-sequence") => Some(ImageType::Gif),
         _ => None,
     };
 
     if let Some(output_type) = output_type {
-        to.set_extension(output_type.to_str());
+        // Update extension for conversion
+        let mut converted_path = to.clone();
+        converted_path.set_extension(output_type.to_str());
+
         // If the attachment is an animated sticker, attempt to convert it to a gif
         // Fall back to the normal converter if this fails
-        if matches!(output_type, ImageType::Gif) {
-            if let Some(video_converter) = video_converter {
-                if convert_heics(from, to, video_converter).is_some() {
-                    return Some(MediaType::Image(output_type.to_str()));
-                }
+        if matches!(output_type, ImageType::Gif)
+            && let Some(video_converter) = video_converter
+        {
+            if convert_heics(from, &converted_path, video_converter).is_some() {
+                *to = converted_path;
+                return Some(MediaType::Image(output_type.to_str()));
             }
+            eprintln!("Unable to convert {from:?}");
         }
 
-        // Standard `HEIC` converter
-        if convert_heic(from, to, image_converter, &output_type).is_none() {
-            eprintln!("Unable to convert {from:?}");
-        } else {
+        // Standard `HEIC` converter fallback
+        if convert_heic(from, &converted_path, image_converter, &output_type).is_some() {
+            *to = converted_path;
             return Some(MediaType::Image(output_type.to_str()));
         }
+        eprintln!("Unable to convert {from:?}");
     }
 
+    // Fallback
     copy_raw(from, to);
     None
 }
@@ -113,11 +117,11 @@ fn convert_heics(from: &Path, to: &Path, video_converter: &VideoConverter) -> Op
     // Directory to store intermediate renders
     let tmp_path = PathBuf::from("/tmp/imessage");
     // Ensure the temp directory tree exists
-    if !tmp_path.exists() {
-        if let Err(why) = create_dir_all(&tmp_path) {
-            eprintln!("Unable to create {tmp_path:?}: {why}");
-            return None;
-        }
+    if !tmp_path.exists()
+        && let Err(why) = create_dir_all(&tmp_path)
+    {
+        eprintln!("Unable to create {tmp_path:?}: {why}");
+        return None;
     }
     let tmp = tmp_path.to_str()?;
 
@@ -165,12 +169,12 @@ fn convert_heics(from: &Path, to: &Path, video_converter: &VideoConverter) -> Op
                     video_converter.name(),
                     vec![
                         "-i",
-                        &format!("{tmp}/frame_{:04}.png", item),
+                        &format!("{tmp}/frame_{item:04}.png"),
                         "-i",
-                        &format!("{tmp}/alpha_{:04}.png", item),
+                        &format!("{tmp}/alpha_{item:04}.png"),
                         "-filter_complex",
                         "[1:v]format=gray,geq=lum='p(X,Y)':a='p(X,Y)'[mask];[0:v][mask]alphamerge",
-                        &format!("{tmp}/merged_{:04}.png", item),
+                        &format!("{tmp}/merged_{item:04}.png"),
                     ],
                 )
             })?;

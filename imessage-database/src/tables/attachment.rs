@@ -2,9 +2,12 @@
  This module represents common (but not all) columns in the `attachment` table.
 */
 
-use rusqlite::{Connection, Error, Result, Row, Statement};
+use plist::Value;
+use rusqlite::{CachedStatement, Connection, Error, Result, Row};
 use sha1::{Digest, Sha1};
+
 use std::{
+    fmt::Write,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -12,39 +15,60 @@ use std::{
 
 use crate::{
     error::{attachment::AttachmentError, table::TableError},
-    message_types::sticker::{get_sticker_effect, StickerEffect},
+    message_types::sticker::{StickerEffect, StickerSource, get_sticker_effect},
     tables::{
         messages::Message,
-        table::{Table, ATTACHMENT},
+        table::{ATTACHMENT, ATTRIBUTION_INFO, STICKER_USER_INFO, Table},
     },
     util::{
         dates::TIMESTAMP_FACTOR,
         dirs::home,
         output::{done_processing, processing},
         platform::Platform,
+        plist::plist_as_dictionary,
         query_context::QueryContext,
         size::format_file_size,
     },
 };
 
+// MARK: Constants
 /// The default root directory for iMessage attachment data
 pub const DEFAULT_ATTACHMENT_ROOT: &str = "~/Library/Messages/Attachments";
+const COLS: &str = "a.rowid, a.filename, a.uti, a.mime_type, a.transfer_name, a.total_bytes, a.is_sticker, a.hide_attachment, a.emoji_image_short_description";
 
+// MARK: MediaType
 /// Represents the [MIME type](https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_Types) of a message's attachment data
 ///
 /// The interior `str` contains the subtype, i.e. `x-m4a` for `audio/x-m4a`
 #[derive(Debug, PartialEq, Eq)]
 pub enum MediaType<'a> {
+    /// Image MIME type, such as `"image/png"` or `"image/jpeg"`
     Image(&'a str),
+    /// Video MIME type, such as `"video/mp4"` or `"video/quicktime"`
     Video(&'a str),
+    /// Audio MIME type, such as `"audio/mp3"` or `"audio/x-m4a`"
     Audio(&'a str),
+    /// Text MIME type, such as `"text/plain"` or `"text/html"`
     Text(&'a str),
+    /// Application MIME type, such as `"application/pdf"` or `"application/json"`
     Application(&'a str),
+    /// Other MIME types that don't fit the standard categories
     Other(&'a str),
+    /// Unknown MIME type when the type could not be determined
     Unknown,
 }
 
 impl MediaType<'_> {
+    /// Given a [`MediaType`], generate the corresponding MIME type string
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use imessage_database::tables::attachment::MediaType;
+    ///
+    /// println!("{:?}", MediaType::Image("png").as_mime_type()); // "image/png"
+    /// ```
+    #[must_use]
     pub fn as_mime_type(&self) -> String {
         match self {
             MediaType::Image(subtype) => format!("image/{subtype}"),
@@ -52,7 +76,7 @@ impl MediaType<'_> {
             MediaType::Audio(subtype) => format!("audio/{subtype}"),
             MediaType::Text(subtype) => format!("text/{subtype}"),
             MediaType::Application(subtype) => format!("application/{subtype}"),
-            MediaType::Other(mime) => mime.to_string(),
+            MediaType::Other(mime) => (*mime).to_string(),
             MediaType::Unknown => String::new(),
         }
     }
@@ -61,6 +85,7 @@ impl MediaType<'_> {
 /// Represents a single row in the `attachment` table.
 #[derive(Debug)]
 pub struct Attachment {
+    /// The unique identifier for the attachment in the database
     pub rowid: i32,
     /// The path to the file on disk
     pub filename: Option<String>,
@@ -74,6 +99,7 @@ pub struct Attachment {
     pub total_bytes: i64,
     /// `true` if the attachment was a sticker, else `false`
     pub is_sticker: bool,
+    /// Flag indicating whether the attachment should be hidden in the UI
     pub hide_attachment: i32,
     /// The prompt used to generate a Genmoji
     pub emoji_description: Option<String>,
@@ -81,6 +107,7 @@ pub struct Attachment {
     pub copied_path: Option<PathBuf>,
 }
 
+// MARK: Table
 impl Table for Attachment {
     fn from_row(row: &Row) -> Result<Attachment> {
         Ok(Attachment {
@@ -97,38 +124,49 @@ impl Table for Attachment {
         })
     }
 
-    fn get(db: &Connection) -> Result<Statement, TableError> {
-        db.prepare(&format!("SELECT * from {ATTACHMENT}"))
-            .map_err(TableError::Attachment)
+    fn get(db: &'_ Connection) -> Result<CachedStatement<'_>, TableError> {
+        Ok(db.prepare_cached(&format!("SELECT * from {ATTACHMENT}"))?)
     }
 
     fn extract(attachment: Result<Result<Self, Error>, Error>) -> Result<Self, TableError> {
         match attachment {
             Ok(Ok(attachment)) => Ok(attachment),
-            Err(why) | Ok(Err(why)) => Err(TableError::Attachment(why)),
+            Err(why) | Ok(Err(why)) => Err(TableError::QueryError(why)),
         }
     }
 }
 
+// MARK: Impl
 impl Attachment {
-    /// Gets a Vector of attachments for a single message
+    /// Gets a Vector of attachments associated with a single message
+    ///
+    /// The order of the attachments aligns with the order of the [`BubbleComponent::Attachment`](crate::tables::messages::models::BubbleComponent::Attachment)s in the message's [`body()`](crate::tables::messages::message::Message::attributed_body).
     pub fn from_message(db: &Connection, msg: &Message) -> Result<Vec<Attachment>, TableError> {
         let mut out_l = vec![];
         if msg.has_attachments() {
             let mut statement = db
                 .prepare(&format!(
                     "
-                    SELECT * FROM message_attachment_join j 
-                        LEFT JOIN attachment AS a ON j.attachment_id = a.ROWID
-                    WHERE j.message_id = {}
+                        SELECT {COLS}
+                        FROM message_attachment_join j 
+                        LEFT JOIN {ATTACHMENT} a ON j.attachment_id = a.ROWID
+                        WHERE j.message_id = {}
                     ",
                     msg.rowid
                 ))
-                .map_err(TableError::Attachment)?;
+                .or_else(|_| {
+                    db.prepare(&format!(
+                        "
+                            SELECT *
+                            FROM message_attachment_join j 
+                            LEFT JOIN {ATTACHMENT} a ON j.attachment_id = a.ROWID
+                            WHERE j.message_id = {}
+                        ",
+                        msg.rowid
+                    ))
+                })?;
 
-            let iter = statement
-                .query_map([], |row| Ok(Attachment::from_row(row)))
-                .map_err(TableError::Attachment)?;
+            let iter = statement.query_map([], |row| Ok(Attachment::from_row(row)))?;
 
             for attachment in iter {
                 let m = Attachment::extract(attachment)?;
@@ -139,6 +177,7 @@ impl Attachment {
     }
 
     /// Get the media type of an attachment
+    #[must_use]
     pub fn mime_type(&'_ self) -> MediaType<'_> {
         match &self.mime_type {
             Some(mime) => {
@@ -221,6 +260,7 @@ impl Attachment {
     }
 
     /// Get the path to an attachment, if it exists
+    #[must_use]
     pub fn path(&self) -> Option<&Path> {
         match &self.filename {
             Some(name) => Some(Path::new(name)),
@@ -229,6 +269,7 @@ impl Attachment {
     }
 
     /// Get the file name extension of an attachment, if it exists
+    #[must_use]
     pub fn extension(&self) -> Option<&str> {
         match self.path() {
             Some(path) => match path.extension() {
@@ -242,19 +283,15 @@ impl Attachment {
     /// Get a reasonable filename for an attachment
     ///
     /// If the [`transfer_name`](Self::transfer_name) field is populated, use that. If it is not present, fall back to the `filename` field.
-    pub fn filename(&self) -> &str {
-        if let Some(transfer_name) = &self.transfer_name {
-            return transfer_name;
-        }
-        if let Some(filename) = &self.filename {
-            return filename;
-        }
-        "Attachment missing name metadata!"
+    #[must_use]
+    pub fn filename(&self) -> Option<&str> {
+        self.transfer_name.as_deref().or(self.filename.as_deref())
     }
 
-    /// Get a human readable file size for an attachment
+    /// Get a human readable file size for an attachment using [`format_file_size`]
+    #[must_use]
     pub fn file_size(&self) -> String {
-        format_file_size(self.total_bytes.try_into().unwrap_or(0))
+        format_file_size(u64::try_from(self.total_bytes).unwrap_or(0))
     }
 
     /// Get the total attachment bytes referenced in the table
@@ -263,32 +300,36 @@ impl Attachment {
         context: &QueryContext,
     ) -> Result<u64, TableError> {
         let mut bytes_query = if context.start.is_some() || context.end.is_some() {
-            let mut statement = format!("SELECT SUM(total_bytes) FROM {ATTACHMENT} a");
+            let mut statement = format!("SELECT IFNULL(SUM(total_bytes), 0) FROM {ATTACHMENT} a");
 
             statement.push_str(" WHERE ");
             if let Some(start) = context.start {
-                statement.push_str(&format!(
+                let _ = write!(
+                    statement,
                     "    a.created_date >= {}",
                     start / TIMESTAMP_FACTOR
-                ));
+                );
             }
             if let Some(end) = context.end {
                 if context.start.is_some() {
                     statement.push_str(" AND ");
                 }
-                statement.push_str(&format!("    a.created_date <= {}", end / TIMESTAMP_FACTOR));
+                let _ = write!(
+                    statement,
+                    "    a.created_date <= {}",
+                    end / TIMESTAMP_FACTOR
+                );
             }
 
-            db.prepare(&statement).map_err(TableError::Attachment)?
+            db.prepare(&statement)?
         } else {
-            db.prepare(&format!("SELECT SUM(total_bytes) FROM {ATTACHMENT}"))
-                .map_err(TableError::Attachment)?
+            db.prepare(&format!(
+                "SELECT IFNULL(SUM(total_bytes), 0) FROM {ATTACHMENT}"
+            ))?
         };
-
-        bytes_query
+        Ok(bytes_query
             .query_row([], |r| -> Result<i64> { r.get(0) })
-            .map(|res: i64| res.try_into().unwrap_or(0))
-            .map_err(TableError::Attachment)
+            .map(|res: i64| u64::try_from(res).unwrap_or(0))?)
     }
 
     /// Given a platform and database source, resolve the path for the current attachment
@@ -296,12 +337,13 @@ impl Attachment {
     /// For macOS, `db_path` is unused. For iOS, `db_path` is the path to the root of the backup directory.
     /// This is the same path used by [`get_connection()`](crate::tables::table::get_connection).
     ///
-    /// On iOS, file names are derived from SHA-1 hash of: `MediaDomain-` concatenated with the relative [`self.filename()`](Self::filename)
+    /// On iOS, file names are derived from SHA-1 hash of `MediaDomain-` concatenated with the relative [`self.filename()`](Self::filename).
     /// Between the domain and the path there is a dash. Read more [here](https://theapplewiki.com/index.php?title=ITunes_Backup).
     ///
     /// Use the optional `custom_attachment_root` parameter when the attachments are not stored in
     /// the same place as the database expects.The expected location is [`DEFAULT_ATTACHMENT_ROOT`].
     /// A custom attachment root like `/custom/path` will overwrite a path like `~/Library/Messages/Attachments/3d/...` to `/custom/path/3d/...`
+    #[must_use]
     pub fn resolved_attachment_path(
         &self,
         platform: &Platform,
@@ -325,11 +367,8 @@ impl Attachment {
     ///
     /// This is defined outside of [`Diagnostic`](crate::tables::table::Diagnostic) because it requires additional data.
     ///
-    /// Get the number of attachments that are missing from the filesystem
-    /// or are missing one of the following columns:
-    ///
-    /// - `ck_server_change_token_blob`
-    /// - `sr_ck_server_change_token_blob`
+    /// Get the number of attachments that are missing, either because the path is missing from the
+    /// table or the path does not point to a file.
     ///
     /// # Example:
     ///
@@ -354,12 +393,8 @@ impl Attachment {
         let mut total_attachments = 0;
         let mut null_attachments = 0;
         let mut size_on_disk: u64 = 0;
-        let mut statement_paths = db
-            .prepare(&format!("SELECT filename FROM {ATTACHMENT}"))
-            .map_err(TableError::Attachment)?;
-        let paths = statement_paths
-            .query_map([], |r| Ok(r.get(0)))
-            .map_err(TableError::Attachment)?;
+        let mut statement_paths = db.prepare(&format!("SELECT filename FROM {ATTACHMENT}"))?;
+        let paths = statement_paths.query_map([], |r| Ok(r.get(0)))?;
 
         let missing_files = paths
             .filter_map(Result::ok)
@@ -417,7 +452,7 @@ impl Attachment {
             if missing_files > 0 && total_attachments > 0 {
                 println!(
                     "    Missing files: {missing_files:?} ({:.0}%)",
-                    (missing_files as f64 / total_attachments as f64) * 100f64
+                    (missing_files as f64 / f64::from(total_attachments)) * 100f64
                 );
                 println!("        No path provided: {null_attachments}");
                 println!(
@@ -448,20 +483,68 @@ impl Attachment {
 
         Some(format!("{}/{directory}/{filename}", db_path.display()))
     }
+
+    /// Get an attachment's plist from the [`STICKER_USER_INFO`] BLOB column
+    ///
+    /// Calling this hits the database, so it is expensive and should
+    /// only get invoked when needed.
+    ///
+    /// This column contains data used for sticker attachments.
+    fn sticker_info(&self, db: &Connection) -> Option<Value> {
+        Value::from_reader(self.get_blob(db, ATTACHMENT, STICKER_USER_INFO, self.rowid.into())?)
+            .ok()
+    }
+
+    /// Get an attachment's plist from the [`ATTRIBUTION_INFO`] BLOB column
+    ///
+    /// Calling this hits the database, so it is expensive and should
+    /// only get invoked when needed.
+    ///
+    /// This column contains metadata used by image attachments.
+    fn attribution_info(&self, db: &Connection) -> Option<Value> {
+        Value::from_reader(self.get_blob(db, ATTACHMENT, ATTRIBUTION_INFO, self.rowid.into())?).ok()
+    }
+
+    /// Parse a sticker's source from the Bundle ID stored in [`STICKER_USER_INFO`] `plist` data
+    ///
+    /// Calling this hits the database, so it is expensive and should
+    /// only get invoked when needed.
+    pub fn get_sticker_source(&self, db: &Connection) -> Option<StickerSource> {
+        if let Some(sticker_info) = self.sticker_info(db) {
+            let plist = plist_as_dictionary(&sticker_info).ok()?;
+            let bundle_id = plist.get("pid")?.as_string()?;
+            return StickerSource::from_bundle_id(bundle_id);
+        }
+        None
+    }
+
+    /// Parse a sticker's application name stored in [`ATTRIBUTION_INFO`] `plist` data
+    ///
+    /// Calling this hits the database, so it is expensive and should
+    /// only get invoked when needed.
+    pub fn get_sticker_source_application_name(&self, db: &Connection) -> Option<String> {
+        if let Some(attribution_info) = self.attribution_info(db) {
+            let plist = plist_as_dictionary(&attribution_info).ok()?;
+            return Some(plist.get("name")?.as_string()?.to_owned());
+        }
+        None
+    }
 }
 
+// MARK: Tests
 #[cfg(test)]
 mod tests {
     use crate::{
         tables::{
-            attachment::{Attachment, MediaType, DEFAULT_ATTACHMENT_ROOT},
+            attachment::{Attachment, DEFAULT_ATTACHMENT_ROOT, MediaType},
             table::get_connection,
         },
-        util::{dirs::default_db_path, platform::Platform, query_context::QueryContext},
+        util::{platform::Platform, query_context::QueryContext},
     };
 
     use std::{
         collections::BTreeSet,
+        env::current_dir,
         path::{Path, PathBuf},
     };
 
@@ -536,21 +619,21 @@ mod tests {
     #[test]
     fn can_get_filename() {
         let attachment = sample_attachment();
-        assert_eq!(attachment.filename(), "c.png");
+        assert_eq!(attachment.filename(), Some("c.png"));
     }
 
     #[test]
     fn can_get_filename_no_transfer_name() {
         let mut attachment = sample_attachment();
         attachment.transfer_name = None;
-        assert_eq!(attachment.filename(), "a/b/c.png");
+        assert_eq!(attachment.filename(), Some("a/b/c.png"));
     }
 
     #[test]
     fn can_get_filename_no_filename() {
         let mut attachment = sample_attachment();
         attachment.filename = None;
-        assert_eq!(attachment.filename(), "c.png");
+        assert_eq!(attachment.filename(), Some("c.png"));
     }
 
     #[test]
@@ -558,7 +641,7 @@ mod tests {
         let mut attachment = sample_attachment();
         attachment.transfer_name = None;
         attachment.filename = None;
-        assert_eq!(attachment.filename(), "Attachment missing name metadata!");
+        assert_eq!(attachment.filename(), None);
     }
 
     #[test]
@@ -606,10 +689,12 @@ mod tests {
         let mut attachment = sample_attachment();
         attachment.filename = Some("~/a/b/c~d.png".to_string());
 
-        assert!(attachment
-            .resolved_attachment_path(&Platform::macOS, &db_path, None)
-            .unwrap()
-            .ends_with("c~d.png"));
+        assert!(
+            attachment
+                .resolved_attachment_path(&Platform::macOS, &db_path, None)
+                .unwrap()
+                .ends_with("c~d.png")
+        );
     }
 
     #[test]
@@ -662,7 +747,11 @@ mod tests {
 
     #[test]
     fn can_get_attachment_bytes_no_filter() {
-        let db_path = default_db_path();
+        let db_path = current_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("imessage-database/test_data/db/test.db");
         let connection = get_connection(&db_path).unwrap();
 
         let context = QueryContext::default();
@@ -672,7 +761,11 @@ mod tests {
 
     #[test]
     fn can_get_attachment_bytes_start_filter() {
-        let db_path = default_db_path();
+        let db_path = current_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("imessage-database/test_data/db/test.db");
         let connection = get_connection(&db_path).unwrap();
 
         let mut context = QueryContext::default();
@@ -683,7 +776,11 @@ mod tests {
 
     #[test]
     fn can_get_attachment_bytes_end_filter() {
-        let db_path = default_db_path();
+        let db_path = current_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("imessage-database/test_data/db/test.db");
         let connection = get_connection(&db_path).unwrap();
 
         let mut context = QueryContext::default();
@@ -694,7 +791,11 @@ mod tests {
 
     #[test]
     fn can_get_attachment_bytes_start_end_filter() {
-        let db_path = default_db_path();
+        let db_path = current_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("imessage-database/test_data/db/test.db");
         let connection = get_connection(&db_path).unwrap();
 
         let mut context = QueryContext::default();
@@ -706,7 +807,11 @@ mod tests {
 
     #[test]
     fn can_get_attachment_bytes_contact_filter() {
-        let db_path = default_db_path();
+        let db_path = current_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("imessage-database/test_data/db/test.db");
         let connection = get_connection(&db_path).unwrap();
 
         let mut context = QueryContext::default();
@@ -718,7 +823,11 @@ mod tests {
 
     #[test]
     fn can_get_attachment_bytes_contact_date_filter() {
-        let db_path = default_db_path();
+        let db_path = current_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("imessage-database/test_data/db/test.db");
         let connection = get_connection(&db_path).unwrap();
 
         let mut context = QueryContext::default();

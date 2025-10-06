@@ -2,23 +2,28 @@
  This module represents common (but not all) columns in the `handle` table.
 */
 
-use rusqlite::{Connection, Error, Result, Row, Statement};
+use rusqlite::{CachedStatement, Connection, Error, Result, Row};
 use std::collections::{BTreeSet, HashMap};
 
 use crate::{
     error::table::TableError,
-    tables::table::{Cacheable, Deduplicate, Diagnostic, Table, HANDLE, ME},
+    tables::table::{Cacheable, Deduplicate, Diagnostic, HANDLE, ME, Table},
     util::output::{done_processing, processing},
 };
 
+// MARK: Handle
 /// Represents a single row in the `handle` table.
 #[derive(Debug)]
 pub struct Handle {
+    /// The unique identifier for the handle in the database
     pub rowid: i32,
+    /// Identifier for a contact, i.e. a phone number or email address
     pub id: String,
+    /// Field used to disambiguate divergent handles that represent the same contact
     pub person_centric_id: Option<String>,
 }
 
+// MARK: Table
 impl Table for Handle {
     fn from_row(row: &Row) -> Result<Handle> {
         Ok(Handle {
@@ -28,19 +33,19 @@ impl Table for Handle {
         })
     }
 
-    fn get(db: &Connection) -> Result<Statement, TableError> {
-        db.prepare(&format!("SELECT * from {HANDLE}"))
-            .map_err(TableError::Handle)
+    fn get(db: &'_ Connection) -> Result<CachedStatement<'_>, TableError> {
+        Ok(db.prepare_cached(&format!("SELECT * from {HANDLE}"))?)
     }
 
     fn extract(handle: Result<Result<Self, Error>, Error>) -> Result<Self, TableError> {
         match handle {
             Ok(Ok(handle)) => Ok(handle),
-            Err(why) | Ok(Err(why)) => Err(TableError::Handle(why)),
+            Err(why) | Ok(Err(why)) => Err(TableError::QueryError(why)),
         }
     }
 }
 
+// MARK: Cache
 impl Cacheable for Handle {
     type K = i32;
     type V = String;
@@ -68,9 +73,7 @@ impl Cacheable for Handle {
         let mut statement = Handle::get(db)?;
 
         // Execute query to build the Handles
-        let handles = statement
-            .query_map([], |row| Ok(Handle::from_row(row)))
-            .map_err(TableError::Handle)?;
+        let handles = statement.query_map([], |row| Ok(Handle::from_row(row)))?;
 
         // Iterate over the handles and update the map
         for handle in handles {
@@ -90,6 +93,7 @@ impl Cacheable for Handle {
     }
 }
 
+// MARK: Dedupe
 impl Deduplicate for Handle {
     type T = String;
 
@@ -99,6 +103,19 @@ impl Deduplicate for Handle {
     /// that represents a single handle for all of the deduplicate handles.
     ///
     /// Assuming no new handles have been written to the database, deduplicated data is deterministic across runs.
+    ///
+    /// # Example:
+    ///
+    /// ```
+    /// use imessage_database::util::dirs::default_db_path;
+    /// use imessage_database::tables::table::{Cacheable, Deduplicate, get_connection};
+    /// use imessage_database::tables::handle::Handle;
+    ///
+    /// let db_path = default_db_path();
+    /// let conn = get_connection(&db_path).unwrap();
+    /// let handles = Handle::cache(&conn).unwrap();
+    /// let deduped_handles = Handle::dedupe(&handles);
+    /// ```
     fn dedupe(duplicated_data: &HashMap<i32, Self::T>) -> HashMap<i32, i32> {
         let mut deduplicated_participants: HashMap<i32, i32> = HashMap::new();
         let mut participant_to_unique_participant_id: HashMap<Self::T, i32> = HashMap::new();
@@ -125,6 +142,7 @@ impl Deduplicate for Handle {
     }
 }
 
+// MARK: Diagnostic
 impl Diagnostic for Handle {
     /// Emit diagnostic data for the Handles table
     ///
@@ -154,20 +172,18 @@ impl Diagnostic for Handle {
             "WHERE person_centric_id NOT NULL"
         );
 
-        if let Ok(mut rows) = db.prepare(query).map_err(TableError::Handle) {
+        if let Ok(mut rows) = db.prepare(query) {
             processing();
 
-            let count_dupes: Option<i32> = rows
-                .query_row([], |r| r.get(0))
-                .map_err(TableError::Handle)?;
+            let count_dupes: Option<i32> = rows.query_row([], |r| r.get(0))?;
 
             done_processing();
 
-            if let Some(dupes) = count_dupes {
-                if dupes > 0 {
-                    println!("Handle diagnostic data:");
-                    println!("    Contacts with more than one ID: {dupes}");
-                }
+            if let Some(dupes) = count_dupes
+                && dupes > 0
+            {
+                println!("Handle diagnostic data:");
+                println!("    Contacts with more than one ID: {dupes}");
             }
         }
 
@@ -175,6 +191,7 @@ impl Diagnostic for Handle {
     }
 }
 
+// MARK: Impl
 impl Handle {
     /// The handles table does not have a lot of information and can have many duplicate values.
     ///
@@ -198,22 +215,15 @@ impl Handle {
 
         if let Ok(mut statement) = statement {
             // Cache the results of the query in memory
-            let contacts = statement
-                .query_map([], |row| {
-                    let person_centric_id: String = row.get(0)?;
-                    let rowid: i32 = row.get(1)?;
-                    let id: String = row.get(2)?;
-                    Ok((person_centric_id, rowid, id))
-                })
-                .map_err(TableError::Handle)?;
+            let contacts = statement.query_map([], |row| {
+                let person_centric_id: String = row.get(0)?;
+                let rowid: i32 = row.get(1)?;
+                let id: String = row.get(2)?;
+                Ok((person_centric_id, rowid, id))
+            })?;
 
             for contact in contacts {
-                match contact {
-                    Ok(tup) => {
-                        row_data.push(tup);
-                    }
-                    Err(why) => return Err(TableError::Handle(why)),
-                }
+                row_data.push(contact?);
             }
 
             // First pass: generate a map of each person_centric_id to its matching ids
@@ -243,6 +253,7 @@ impl Handle {
     }
 }
 
+// MARK: Tests
 #[cfg(test)]
 mod tests {
     use crate::tables::{handle::Handle, table::Deduplicate};
@@ -300,9 +311,9 @@ mod tests {
             .into_iter()
             .collect::<Vec<(i32, i32)>>();
 
-        output_1.sort();
-        output_2.sort();
-        output_3.sort();
+        output_1.sort_unstable();
+        output_2.sort_unstable();
+        output_3.sort_unstable();
 
         assert_eq!(output_1, output_2);
         assert_eq!(output_1, output_3);

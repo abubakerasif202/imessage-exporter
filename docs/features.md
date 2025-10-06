@@ -4,7 +4,14 @@ The library and binary crates aim to provide the most comprehensive and accurate
 
 ## Targeted Versions
 
-This tool targets the current latest public release for macOS and iMessage. It may work with older databases, but all features may not be available.
+This tool targets the current latest public release for Messages.app. It may work with older databases, but all features may not be available.
+
+## Supported data sources
+
+- Local macOS messages
+- Encrypted or unencrypted local iOS backups
+  - Unencrypted backups are resolved normally
+  - Uses [crabapple](https://github.com/ReagentX/crabapple) to decrypt data from encrypted iOS backups
 
 ## Supported Message Features
 
@@ -12,10 +19,11 @@ This tool targets the current latest public release for macOS and iMessage. It m
   - Correctly extracts time-zone corrected timestamps
   - Detects when a message was read and calculates the time until read for both parties
     - Humanizes display of time-until-read duration
-  - Parses `typedstream` message body data
+  - Parses `typedstream` message body data using [`crabstep`](https://github.com/ReagentX/crabstep)
   - Detects the service a message was sent from
     - In HTML exports, balloons are colored correctly for the service they were sent with
-  - Supports iMessage, SMS, MMS, and RCS
+    - Supports iMessage, SMS, MMS, and RCS
+  - Displays translated message content
 - Formatted Text
   - Parses formatted text ranges from `typedstream` message body data
   - Supports all iMessage text format ranges:
@@ -82,7 +90,7 @@ This tool targets the current latest public release for macOS and iMessage. It m
     - Preview images display in HTML exports
     - URLs that have rotten may still retain some context if they have cached data
   - Handles cases where URL messages are overloaded with other message types
-    - Apple Music (including preview streams)
+    - Apple Music (including preview streams and lyrics)
     - Apple Maps (including `Placemark` data)
     - App Store (including app metadata)
     - Rich Collaboration
@@ -94,6 +102,7 @@ This tool targets the current latest public release for macOS and iMessage. It m
     - SharePlay/Facetime messages
     - Check In messages
     - Find My messages
+    - Polls and Votes
 - Handwritten Messages
   - Parses the protobuf payload to extract [handwritten](https://support.apple.com/en-my/guide/iphone/iph3d4cb79c9/ios) message data
     - Displayed as embedded `svg` in HTML exports
@@ -108,3 +117,8 @@ This tool targets the current latest public release for macOS and iMessage. It m
   - On startup:
     - Different handles that belong to the same person are combined
     - Chatrooms that contain identical contacts (i.e., duplicated handles) are combined
+- Announcements
+  - Handles all types of chatroom announcements
+    - Group photo changes
+    - Chat participant modifications
+    - Chat background settings

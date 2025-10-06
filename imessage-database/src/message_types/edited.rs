@@ -3,17 +3,19 @@
 
  The main data type used to represent these types of messages is [`EditedMessage`].
 */
-
+use crabstep::TypedStreamDeserializer;
 use plist::Value;
 
 use crate::{
     error::plist::PlistParseError,
     message_types::variants::BalloonProvider,
+    tables::messages::{body::parse_body_typedstream, models::BubbleComponent},
     util::{
         dates::TIMESTAMP_FACTOR,
-        plist::{extract_array_key, extract_bytes_key, extract_dictionary, extract_int_key},
-        streamtyped::parse,
-        typedstream::parser::TypedStreamReader,
+        plist::{
+            extract_array_key, extract_bytes_key, extract_dictionary, extract_int_key,
+            plist_as_dictionary,
+        },
     },
 };
 
@@ -29,24 +31,36 @@ pub enum EditStatus {
 }
 
 /// Represents a single edit event for a message part
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct EditedEvent {
     /// The date the message part was edited
     pub date: i64,
     /// The content of the edited message part deserialized from the [`typedstream`](crate::util::typedstream) format
-    pub text: String,
+    pub text: Option<String>,
+    /// The parsed [`typedstream`](crate::util::typedstream) component data used to add attributes to the message text
+    pub components: Vec<BubbleComponent>,
     /// A GUID reference to another message
     pub guid: Option<String>,
 }
 
 impl EditedEvent {
-    pub(crate) fn new(date: i64, text: String, guid: Option<String>) -> Self {
-        Self { date, text, guid }
+    pub(crate) fn new(
+        date: i64,
+        text: Option<String>,
+        components: Vec<BubbleComponent>,
+        guid: Option<String>,
+    ) -> Self {
+        Self {
+            date,
+            text,
+            components,
+            guid,
+        }
     }
 }
 
 /// Tracks the edit status and history for a specific part of a message
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct EditedMessagePart {
     /// The type of edit made to the given message part
     pub status: EditStatus,
@@ -92,7 +106,7 @@ impl Default for EditedMessagePart {
 /// # Documentation
 ///
 /// Apple describes editing and unsending messages [here](https://support.apple.com/guide/iphone/unsend-and-edit-messages-iphe67195653/ios).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct EditedMessage {
     /// Contains data representing each part of an edited message
     pub parts: Vec<EditedMessagePart>,
@@ -101,9 +115,7 @@ pub struct EditedMessage {
 impl<'a> BalloonProvider<'a> for EditedMessage {
     fn from_map(payload: &'a Value) -> Result<Self, PlistParseError> {
         // Parse payload
-        let plist_root = payload.as_dictionary().ok_or_else(|| {
-            PlistParseError::InvalidType("root".to_string(), "dictionary".to_string())
-        })?;
+        let plist_root = plist_as_dictionary(payload)?;
 
         // Get the parts of the message that may have been altered
         let message_parts = extract_dictionary(plist_root, "otr")?;
@@ -130,21 +142,17 @@ impl<'a> BalloonProvider<'a> for EditedMessage {
 
                     let timestamp = extract_int_key(message_data, "d")? * TIMESTAMP_FACTOR;
 
-                    let typedstream = extract_bytes_key(message_data, "t")?;
+                    let data = extract_bytes_key(message_data, "t")?;
 
-                    let mut parser = TypedStreamReader::from(typedstream);
-                    let text = match parser
-                        .parse()
-                        .ok()
-                        .as_ref()
-                        .and_then(|items| items.first())
-                        .and_then(|item| item.as_nsstring())
-                        .map(String::from)
-                    {
-                        Some(text) => text,
-                        None => parse(typedstream.to_vec())
-                            .map_err(PlistParseError::StreamTypedError)?,
-                    };
+                    let mut typedstream = TypedStreamDeserializer::new(data);
+                    let result = parse_body_typedstream(Some(typedstream.iter_root()?), None)
+                        .ok_or_else(|| {
+                            PlistParseError::InvalidEditedMessage(
+                                "Failed to parse typedstream data".to_string(),
+                            )
+                        })?;
+
+                    let text = result.text;
 
                     let guid = message_data
                         .get("bcg")
@@ -153,8 +161,12 @@ impl<'a> BalloonProvider<'a> for EditedMessage {
 
                     if let Some(item) = edited.parts.get_mut(parsed_key) {
                         item.status = EditStatus::Edited;
-                        item.edit_history
-                            .push(EditedEvent::new(timestamp, text, guid))
+                        item.edit_history.push(EditedEvent::new(
+                            timestamp,
+                            text,
+                            result.components,
+                            guid,
+                        ));
                     }
                 }
             }
@@ -185,11 +197,13 @@ impl EditedMessage {
     }
 
     /// Gets the edited message data for the given message part index
+    #[must_use]
     pub fn part(&self, index: usize) -> Option<&EditedMessagePart> {
         self.parts.get(index)
     }
 
-    /// Gets the edited message data for the given message part index
+    /// Indicates if the given message part has been edited
+    #[must_use]
     pub fn is_unedited_at(&self, index: usize) -> bool {
         match self.parts.get(index) {
             Some(part) => matches!(part.status, EditStatus::Original),
@@ -198,15 +212,19 @@ impl EditedMessage {
     }
 
     /// Gets the number of parts that may or may not have been edited or unsent
+    #[must_use]
     pub fn items(&self) -> usize {
         self.parts.len()
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod test_parser {
     use crate::message_types::edited::{EditStatus, EditedEvent, EditedMessagePart};
+    use crate::message_types::text_effects::{Style, TextEffect};
     use crate::message_types::{edited::EditedMessage, variants::BalloonProvider};
+    use crate::tables::messages::models::{BubbleComponent, TextAttributes};
+
     use plist::Value;
     use std::env::current_dir;
     use std::fs::File;
@@ -225,10 +243,46 @@ mod tests {
             parts: vec![EditedMessagePart {
                 status: EditStatus::Edited,
                 edit_history: vec![
-                    EditedEvent::new(690513474000000000, "First message  ".to_string(), None),
-                    EditedEvent::new(690513480000000000, "Edit 1".to_string(), None),
-                    EditedEvent::new(690513485000000000, "Edit 2".to_string(), None),
-                    EditedEvent::new(690513494000000000, "Edited message".to_string(), None),
+                    EditedEvent::new(
+                        690513474000000000,
+                        Some("First message  ".to_string()),
+                        vec![BubbleComponent::Text(vec![TextAttributes {
+                            start: 0,
+                            end: 15,
+                            effects: vec![TextEffect::Default],
+                        }])],
+                        None,
+                    ),
+                    EditedEvent::new(
+                        690513480000000000,
+                        Some("Edit 1".to_string()),
+                        vec![BubbleComponent::Text(vec![TextAttributes {
+                            start: 0,
+                            end: 6,
+                            effects: vec![TextEffect::Default],
+                        }])],
+                        None,
+                    ),
+                    EditedEvent::new(
+                        690513485000000000,
+                        Some("Edit 2".to_string()),
+                        vec![BubbleComponent::Text(vec![TextAttributes {
+                            start: 0,
+                            end: 6,
+                            effects: vec![TextEffect::Default],
+                        }])],
+                        None,
+                    ),
+                    EditedEvent::new(
+                        690513494000000000,
+                        Some("Edited message".to_string()),
+                        vec![BubbleComponent::Text(vec![TextAttributes {
+                            start: 0,
+                            end: 14,
+                            effects: vec![TextEffect::Default],
+                        }])],
+                        None,
+                    ),
                 ],
             }],
         };
@@ -258,10 +312,27 @@ mod tests {
                 EditedMessagePart {
                     status: EditStatus::Edited,
                     edit_history: vec![
-                        EditedEvent::new(690514004000000000, "here we go!".to_string(), None),
+                        EditedEvent::new(
+                            690514004000000000,
+                            Some("here we go!".to_string()),
+                            vec![BubbleComponent::Text(vec![TextAttributes {
+                                start: 0,
+                                end: 11,
+                                effects: vec![TextEffect::Default],
+                            }])],
+                            None,
+                        ),
                         EditedEvent::new(
                             690514772000000000,
-                            "https://github.com/ReagentX/imessage-exporter/issues/10".to_string(),
+                            Some(
+                                "https://github.com/ReagentX/imessage-exporter/issues/10"
+                                    .to_string(),
+                            ),
+                            vec![BubbleComponent::Text(vec![TextAttributes {
+                                start: 0,
+                                end: 55,
+                                effects: vec![TextEffect::Default],
+                            }])],
                             Some("292BF9C6-C9B8-4827-BE65-6EA1C9B5B384".to_string()),
                         ),
                     ],
@@ -288,18 +359,35 @@ mod tests {
                 edit_history: vec![
                     EditedEvent::new(
                         690514809000000000,
-                        "This is a normal message".to_string(),
+                        Some("This is a normal message".to_string()),
+                        vec![BubbleComponent::Text(vec![TextAttributes {
+                            start: 0,
+                            end: 24,
+                            effects: vec![TextEffect::Default],
+                        }])],
                         None,
                     ),
                     EditedEvent::new(
                         690514819000000000,
-                        "Edit to a url https://github.com/ReagentX/imessage-exporter/issues/10"
-                            .to_string(),
+                        Some(
+                            "Edit to a url https://github.com/ReagentX/imessage-exporter/issues/10"
+                                .to_string(),
+                        ),
+                        vec![BubbleComponent::Text(vec![TextAttributes {
+                            start: 0,
+                            end: 69,
+                            effects: vec![TextEffect::Default],
+                        }])],
                         Some("0B9103FE-280C-4BD0-A66F-4EDEE3443247".to_string()),
                     ),
                     EditedEvent::new(
                         690514834000000000,
-                        "And edit it back to a normal message...".to_string(),
+                        Some("And edit it back to a normal message...".to_string()),
+                        vec![BubbleComponent::Text(vec![TextAttributes {
+                            start: 0,
+                            end: 39,
+                            effects: vec![TextEffect::Default],
+                        }])],
                         Some("0D93DF88-05BA-4418-9B20-79918ADD9923".to_string()),
                     ),
                 ],
@@ -334,7 +422,7 @@ mod tests {
         let plist_path = current_dir()
             .unwrap()
             .as_path()
-            .join("test_data/edited_message/MutliPartOneDeleted.plist");
+            .join("test_data/edited_message/MultiPartOneDeleted.plist");
         let plist_data = File::open(plist_path).unwrap();
         let plist = Value::from_reader(plist_data).unwrap();
         let parsed = EditedMessage::from_map(&plist).unwrap();
@@ -386,10 +474,24 @@ mod tests {
                 EditedMessagePart {
                     status: EditStatus::Edited,
                     edit_history: vec![
-                        EditedEvent::new(743907180000000000, "Second message".to_string(), None),
+                        EditedEvent::new(
+                            743907180000000000,
+                            Some("Second message".to_string()),
+                            vec![BubbleComponent::Text(vec![TextAttributes {
+                                start: 0,
+                                end: 14,
+                                effects: vec![TextEffect::Default],
+                            }])],
+                            None,
+                        ),
                         EditedEvent::new(
                             743907190000000000,
-                            "Second message got edited!".to_string(),
+                            Some("Second message got edited!".to_string()),
+                            vec![BubbleComponent::Text(vec![TextAttributes {
+                                start: 0,
+                                end: 26,
+                                effects: vec![TextEffect::Default],
+                            }])],
                             None,
                         ),
                     ],
@@ -423,10 +525,24 @@ mod tests {
                 EditedMessagePart {
                     status: EditStatus::Edited,
                     edit_history: vec![
-                        EditedEvent::new(743907435000000000, "Second test".to_string(), None),
+                        EditedEvent::new(
+                            743907435000000000,
+                            Some("Second test".to_string()),
+                            vec![BubbleComponent::Text(vec![TextAttributes {
+                                start: 0,
+                                end: 11,
+                                effects: vec![TextEffect::Default],
+                            }])],
+                            None,
+                        ),
                         EditedEvent::new(
                             743907448000000000,
-                            "Second test was edited!".to_string(),
+                            Some("Second test was edited!".to_string()),
+                            vec![BubbleComponent::Text(vec![TextAttributes {
+                                start: 0,
+                                end: 23,
+                                effects: vec![TextEffect::Default],
+                            }])],
                             None,
                         ),
                     ],
@@ -439,5 +555,299 @@ mod tests {
         };
 
         assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn test_parse_edited_with_formatting() {
+        let plist_path = current_dir()
+            .unwrap()
+            .as_path()
+            .join("test_data/edited_message/EditedWithFormatting.plist");
+        let plist_data = File::open(plist_path).unwrap();
+        let plist = Value::from_reader(plist_data).unwrap();
+        let parsed = EditedMessage::from_map(&plist).unwrap();
+
+        let expected = EditedMessage {
+            parts: vec![EditedMessagePart {
+                status: EditStatus::Edited,
+                edit_history: vec![
+                    EditedEvent::new(
+                        758573156000000000,
+                        Some("Test".to_string()),
+                        vec![BubbleComponent::Text(vec![TextAttributes {
+                            start: 0,
+                            end: 4,
+                            effects: vec![TextEffect::Default],
+                        }])],
+                        None,
+                    ),
+                    EditedEvent::new(
+                        758573166000000000,
+                        Some("Test".to_string()),
+                        vec![BubbleComponent::Text(vec![TextAttributes {
+                            start: 0,
+                            end: 4,
+                            effects: vec![TextEffect::Styles(vec![Style::Strikethrough])],
+                        }])],
+                        Some("76A466B8-D21E-4A20-AF62-FF2D3A20D31C".to_string()),
+                    ),
+                ],
+            }],
+        };
+
+        assert_eq!(parsed, expected);
+
+        let expected_item = Some(expected.parts.first().unwrap());
+        assert_eq!(parsed.part(0), expected_item);
+    }
+}
+
+#[cfg(test)]
+mod test_gen {
+    use plist::Value;
+    use std::env::current_dir;
+    use std::fs::File;
+
+    use crate::message_types::text_effects::{Style, TextEffect};
+    use crate::message_types::{edited::EditedMessage, variants::BalloonProvider};
+    use crate::tables::messages::models::{BubbleComponent, TextAttributes};
+
+    #[test]
+    fn test_parse_edited() {
+        let plist_path = current_dir()
+            .unwrap()
+            .as_path()
+            .join("test_data/edited_message/Edited.plist");
+        let plist_data = File::open(plist_path).unwrap();
+        let plist = Value::from_reader(plist_data).unwrap();
+        let parsed = EditedMessage::from_map(&plist).unwrap();
+
+        let expected_attrs = [
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                15,
+                vec![TextEffect::Default],
+            )])],
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                6,
+                vec![TextEffect::Default],
+            )])],
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                6,
+                vec![TextEffect::Default],
+            )])],
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                14,
+                vec![TextEffect::Default],
+            )])],
+        ];
+
+        for event in parsed.parts {
+            for (idx, part) in event.edit_history.iter().enumerate() {
+                assert_eq!(part.components, expected_attrs[idx]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_edited_to_link() {
+        let plist_path = current_dir()
+            .unwrap()
+            .as_path()
+            .join("test_data/edited_message/EditedToLink.plist");
+        let plist_data = File::open(plist_path).unwrap();
+        let plist = Value::from_reader(plist_data).unwrap();
+        let parsed = EditedMessage::from_map(&plist).unwrap();
+
+        let expected_attrs = [
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                11,
+                vec![TextEffect::Default],
+            )])],
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                55,
+                vec![TextEffect::Default],
+            )])],
+        ];
+
+        for event in parsed.parts {
+            for (idx, part) in event.edit_history.iter().enumerate() {
+                assert_eq!(part.components, expected_attrs[idx]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_edited_to_link_and_back() {
+        let plist_path = current_dir()
+            .unwrap()
+            .as_path()
+            .join("test_data/edited_message/EditedToLinkAndBack.plist");
+        let plist_data = File::open(plist_path).unwrap();
+        let plist = Value::from_reader(plist_data).unwrap();
+        let parsed = EditedMessage::from_map(&plist).unwrap();
+
+        let expected_attrs = [
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                24,
+                vec![TextEffect::Default],
+            )])],
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                69,
+                vec![TextEffect::Default],
+            )])],
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                39,
+                vec![TextEffect::Default],
+            )])],
+        ];
+
+        for event in parsed.parts {
+            for (idx, part) in event.edit_history.iter().enumerate() {
+                assert_eq!(part.components, expected_attrs[idx]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_deleted() {
+        let plist_path = current_dir()
+            .unwrap()
+            .as_path()
+            .join("test_data/edited_message/Deleted.plist");
+        let plist_data = File::open(plist_path).unwrap();
+        let plist = Value::from_reader(plist_data).unwrap();
+        let parsed = EditedMessage::from_map(&plist).unwrap();
+
+        let expected_attrs: [Vec<BubbleComponent>; 0] = [];
+
+        for event in parsed.parts {
+            for (idx, part) in event.edit_history.iter().enumerate() {
+                assert_eq!(part.components, expected_attrs[idx]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_multipart_deleted() {
+        let plist_path = current_dir()
+            .unwrap()
+            .as_path()
+            .join("test_data/edited_message/MultiPartOneDeleted.plist");
+        let plist_data = File::open(plist_path).unwrap();
+        let plist = Value::from_reader(plist_data).unwrap();
+        let parsed = EditedMessage::from_map(&plist).unwrap();
+
+        let expected_attrs: [Vec<BubbleComponent>; 0] = [];
+
+        for event in parsed.parts {
+            for (idx, part) in event.edit_history.iter().enumerate() {
+                assert_eq!(part.components, expected_attrs[idx]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_multipart_edited_and_deleted() {
+        let plist_path = current_dir()
+            .unwrap()
+            .as_path()
+            .join("test_data/edited_message/EditedAndDeleted.plist");
+        let plist_data = File::open(plist_path).unwrap();
+        let plist = Value::from_reader(plist_data).unwrap();
+        let parsed = EditedMessage::from_map(&plist).unwrap();
+
+        let expected_attrs = [
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                14,
+                vec![TextEffect::Default],
+            )])],
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                26,
+                vec![TextEffect::Default],
+            )])],
+        ];
+
+        for event in parsed.parts {
+            for (idx, part) in event.edit_history.iter().enumerate() {
+                assert_eq!(part.components, expected_attrs[idx]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_multipart_edited_and_unsent() {
+        let plist_path = current_dir()
+            .unwrap()
+            .as_path()
+            .join("test_data/edited_message/EditedAndUnsent.plist");
+        let plist_data = File::open(plist_path).unwrap();
+        let plist = Value::from_reader(plist_data).unwrap();
+        let parsed = EditedMessage::from_map(&plist).unwrap();
+
+        for parts in &parsed.parts {
+            for part in &parts.edit_history {
+                println!("{:#?}", part.components);
+            }
+        }
+
+        let expected_attrs: [Vec<BubbleComponent>; 2] = [
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                11,
+                vec![TextEffect::Default],
+            )])],
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                23,
+                vec![TextEffect::Default],
+            )])],
+        ];
+
+        for event in parsed.parts {
+            for (idx, part) in event.edit_history.iter().enumerate() {
+                assert_eq!(part.components, expected_attrs[idx]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_edited_with_formatting() {
+        let plist_path = current_dir()
+            .unwrap()
+            .as_path()
+            .join("test_data/edited_message/EditedWithFormatting.plist");
+        let plist_data = File::open(plist_path).unwrap();
+        let plist = Value::from_reader(plist_data).unwrap();
+        let parsed = EditedMessage::from_map(&plist).unwrap();
+
+        let expected_attrs: [Vec<BubbleComponent>; 2] = [
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                4,
+                vec![TextEffect::Default],
+            )])],
+            vec![BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                4,
+                vec![TextEffect::Styles(vec![Style::Strikethrough])],
+            )])],
+        ];
+
+        for event in parsed.parts {
+            for (idx, part) in event.edit_history.iter().enumerate() {
+                assert_eq!(part.components, expected_attrs[idx]);
+            }
+        }
     }
 }

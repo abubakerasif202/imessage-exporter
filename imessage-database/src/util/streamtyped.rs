@@ -18,12 +18,43 @@ const START_PATTERN: [u8; 2] = [0x0001, 0x002b];
 /// - <https://www.compart.com/en/unicode/U+0084>
 const END_PATTERN: [u8; 2] = [0x0086, 0x0084];
 
-/// Parse the body text from a known type of `typedstream` `attributedBody` file.
+/// Parse the body [text](crate::tables::messages::message::Message::text) from a known type of `typedstream` `attributedBody` file.
 ///
 /// `attributedBody` `typedstream` data looks like:
 ///
 /// ```txt
 /// streamtyped���@���NSAttributedString�NSObject����NSString��+Example message  ��iI���� NSDictionary��i����__kIMMessagePartAttributeName����NSNumber��NSValue��*������
+/// ```
+///
+/// In that example, the returned body text would be `"Example message"`.
+///
+/// ## Legacy parsing
+///
+/// If the `typedstream` data cannot be deserialized, we fall back to athislegacy string parsing algorithm that
+/// only supports unstyled text.
+///
+/// If the message has attachments, there will be one [`U+FFFC`](https://www.compart.com/en/unicode/U+FFFC) character
+/// for each attachment and one [`U+FFFD`](https://www.compart.com/en/unicode/U+FFFD) for app messages that we need
+/// to format.
+///
+/// ## Sample
+///
+/// An iMessage that contains body text like:
+///
+/// ```
+/// let message_text = "\u{FFFC}Check out this photo!";
+/// ```
+///
+/// Will have a `body()` of:
+///
+/// ```
+/// use imessage_database::message_types::text_effects::TextEffect;
+/// use imessage_database::tables::messages::{models::{TextAttributes, BubbleComponent, AttachmentMeta}};
+///  
+/// let result = vec![
+///     BubbleComponent::Attachment(AttachmentMeta::default()),
+///     BubbleComponent::Text(vec![TextAttributes::new(3, 24, vec![TextEffect::Default])]),
+/// ];
 /// ```
 pub fn parse(mut stream: Vec<u8>) -> Result<String, StreamTypedError> {
     // Find the start index and drain
@@ -174,6 +205,7 @@ mod tests {
 
     #[test]
     fn test_parse_text_app() {
+        // This test removed a block of text so the pointers become misaligned during parsing
         let plist_path = current_dir()
             .unwrap()
             .as_path()
@@ -229,7 +261,7 @@ mod tests {
         let mut bytes = vec![];
         file.read_to_end(&mut bytes).unwrap();
         let parsed = parse(bytes).unwrap();
-        println!("{:?}", parsed);
+        println!("{parsed:?}");
 
         let expected = "From arbitrary byte stream:\r\u{FFFC}To native Rust data structures:\r";
 
@@ -246,7 +278,7 @@ mod tests {
         let mut bytes = vec![];
         file.read_to_end(&mut bytes).unwrap();
         let parsed = parse(bytes).unwrap();
-        println!("{:?}", parsed);
+        println!("{parsed:?}");
 
         let expected =
             "\u{FFFC}This is how the notes look to me fyi, in case it helps make sense of anything";
@@ -264,7 +296,7 @@ mod tests {
         let mut bytes = vec![];
         file.read_to_end(&mut bytes).unwrap();
         let parsed = parse(bytes).unwrap();
-        println!("{:?}", parsed);
+        println!("{parsed:?}");
 
         let expected = "A single ChatGPT instance takes 5MW of power to run";
 

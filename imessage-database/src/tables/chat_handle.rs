@@ -7,12 +7,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::{
     error::table::TableError,
     tables::table::{
-        Cacheable, Deduplicate, Diagnostic, Table, CHAT_HANDLE_JOIN, CHAT_MESSAGE_JOIN,
+        CHAT_HANDLE_JOIN, CHAT_MESSAGE_JOIN, Cacheable, Deduplicate, Diagnostic, Table,
     },
     util::output::{done_processing, processing},
 };
-use rusqlite::{Connection, Error, Result, Row, Statement};
+use rusqlite::{CachedStatement, Connection, Error, Result, Row};
 
+// MARK: Struct
 /// Represents a single row in the `chat_handle_join` table.
 pub struct ChatToHandle {
     chat_id: i32,
@@ -27,19 +28,19 @@ impl Table for ChatToHandle {
         })
     }
 
-    fn get(db: &Connection) -> Result<Statement, TableError> {
-        db.prepare(&format!("SELECT * FROM {CHAT_HANDLE_JOIN}"))
-            .map_err(TableError::ChatToHandle)
+    fn get(db: &'_ Connection) -> Result<CachedStatement<'_>, TableError> {
+        Ok(db.prepare_cached(&format!("SELECT * FROM {CHAT_HANDLE_JOIN}"))?)
     }
 
     fn extract(chat_to_handle: Result<Result<Self, Error>, Error>) -> Result<Self, TableError> {
         match chat_to_handle {
             Ok(Ok(chat_to_handle)) => Ok(chat_to_handle),
-            Err(why) | Ok(Err(why)) => Err(TableError::ChatToHandle(why)),
+            Err(why) | Ok(Err(why)) => Err(TableError::QueryError(why)),
         }
     }
 }
 
+// MARK: Cache
 impl Cacheable for ChatToHandle {
     type K = i32;
     type V = BTreeSet<i32>;
@@ -60,9 +61,7 @@ impl Cacheable for ChatToHandle {
         let mut cache: HashMap<i32, BTreeSet<i32>> = HashMap::new();
 
         let mut rows = ChatToHandle::get(db)?;
-        let mappings = rows
-            .query_map([], |row| Ok(ChatToHandle::from_row(row)))
-            .map_err(TableError::ChatToHandle)?;
+        let mappings = rows.query_map([], |row| Ok(ChatToHandle::from_row(row)))?;
 
         for mapping in mappings {
             let joiner = ChatToHandle::extract(mapping)?;
@@ -88,6 +87,19 @@ impl Deduplicate for ChatToHandle {
     /// that represents a single chat for all of the same participants, even if they have multiple handles.
     ///
     /// Assuming no new chat-handle relationships have been written to the database, deduplicated data is deterministic across runs.
+    ///
+    /// # Example:
+    ///
+    /// ```
+    /// use imessage_database::util::dirs::default_db_path;
+    /// use imessage_database::tables::table::{Cacheable, Deduplicate, get_connection};
+    /// use imessage_database::tables::chat_handle::ChatToHandle;
+    ///
+    /// let db_path = default_db_path();
+    /// let conn = get_connection(&db_path).unwrap();
+    /// let chatrooms = ChatToHandle::cache(&conn).unwrap();
+    /// let deduped_chatrooms = ChatToHandle::dedupe(&chatrooms);
+    /// ```
     fn dedupe(duplicated_data: &HashMap<i32, Self::T>) -> HashMap<i32, i32> {
         let mut deduplicated_chats: HashMap<i32, i32> = HashMap::new();
         let mut participants_to_unique_chat_id: HashMap<Self::T, i32> = HashMap::new();
@@ -113,6 +125,7 @@ impl Deduplicate for ChatToHandle {
     }
 }
 
+// MARK: Diagnostic
 impl Diagnostic for ChatToHandle {
     /// Emit diagnostic data for the Chat to Handle join table
     ///
@@ -133,12 +146,10 @@ impl Diagnostic for ChatToHandle {
         processing();
 
         // Get the Chat IDs that are associated with messages
-        let mut statement_message_chats = db
-            .prepare(&format!("SELECT DISTINCT chat_id from {CHAT_MESSAGE_JOIN}"))
-            .map_err(TableError::ChatToHandle)?;
-        let statement_message_chat_rows = statement_message_chats
-            .query_map([], |row: &Row| -> Result<i32> { row.get(0) })
-            .map_err(TableError::ChatToHandle)?;
+        let mut statement_message_chats =
+            db.prepare(&format!("SELECT DISTINCT chat_id from {CHAT_MESSAGE_JOIN}"))?;
+        let statement_message_chat_rows =
+            statement_message_chats.query_map([], |row: &Row| -> Result<i32> { row.get(0) })?;
         let mut unique_chats_from_messages: HashSet<i32> = HashSet::new();
         statement_message_chat_rows.into_iter().for_each(|row| {
             if let Ok(row) = row {
@@ -147,12 +158,10 @@ impl Diagnostic for ChatToHandle {
         });
 
         // Get the Chat IDs that are associated with handles
-        let mut statement_handle_chats = db
-            .prepare(&format!("SELECT DISTINCT chat_id from {CHAT_HANDLE_JOIN}"))
-            .map_err(TableError::ChatToHandle)?;
-        let statement_handle_chat_rows = statement_handle_chats
-            .query_map([], |row: &Row| -> Result<i32> { row.get(0) })
-            .map_err(TableError::ChatToHandle)?;
+        let mut statement_handle_chats =
+            db.prepare(&format!("SELECT DISTINCT chat_id from {CHAT_HANDLE_JOIN}"))?;
+        let statement_handle_chat_rows =
+            statement_handle_chats.query_map([], |row: &Row| -> Result<i32> { row.get(0) })?;
         let mut unique_chats_from_handles: HashSet<i32> = HashSet::new();
         statement_handle_chat_rows.into_iter().for_each(|row| {
             if let Ok(row) = row {
@@ -175,6 +184,7 @@ impl Diagnostic for ChatToHandle {
     }
 }
 
+// MARK: Tests
 #[cfg(test)]
 mod tests {
     use crate::tables::{chat_handle::ChatToHandle, table::Deduplicate};
@@ -247,9 +257,9 @@ mod tests {
             .into_iter()
             .collect::<Vec<(i32, i32)>>();
 
-        output_1.sort();
-        output_2.sort();
-        output_3.sort();
+        output_1.sort_unstable();
+        output_2.sort_unstable();
+        output_3.sort_unstable();
 
         assert_eq!(output_1, output_2);
         assert_eq!(output_1, output_3);

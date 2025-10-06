@@ -7,7 +7,7 @@ use chrono::prelude::*;
 
 use crate::{
     error::query_context::QueryContextError,
-    util::dates::{get_offset, TIMESTAMP_FACTOR},
+    util::dates::{TIMESTAMP_FACTOR, get_offset},
 };
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -130,6 +130,7 @@ impl QueryContext {
     /// context.set_start("2023-01-01");
     /// assert!(context.has_filters());
     /// ```
+    #[must_use]
     pub fn has_filters(&self) -> bool {
         self.start.is_some()
             || self.end.is_some()
@@ -140,12 +141,10 @@ impl QueryContext {
 
 #[cfg(test)]
 mod use_tests {
-    use std::env::set_var;
-
     use chrono::prelude::*;
 
     use crate::util::{
-        dates::{format, get_offset, TIMESTAMP_FACTOR},
+        dates::{TIMESTAMP_FACTOR, format, get_offset},
         query_context::QueryContext,
     };
 
@@ -159,9 +158,6 @@ mod use_tests {
 
     #[test]
     fn can_create_start() {
-        // Set timezone to PST for consistent Local time
-        set_var("TZ", "PST");
-
         let mut context = QueryContext::default();
         context.set_start("2020-01-01").unwrap();
 
@@ -181,9 +177,6 @@ mod use_tests {
 
     #[test]
     fn can_create_end() {
-        // Set timezone to PST for consistent Local time
-        set_var("TZ", "PST");
-
         let mut context = QueryContext::default();
         context.set_end("2020-01-01").unwrap();
 
@@ -201,9 +194,6 @@ mod use_tests {
 
     #[test]
     fn can_create_both() {
-        // Set timezone to PST for consistent Local time
-        set_var("TZ", "PST");
-
         let mut context = QueryContext::default();
         context.set_start("2020-01-01").unwrap();
         context.set_end("2020-02-02").unwrap();

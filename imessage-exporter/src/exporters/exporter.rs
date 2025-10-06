@@ -1,7 +1,7 @@
 use std::{borrow::Cow, fs::File, io::BufWriter, marker::Sized};
 
 use imessage_database::{
-    error::{plist::PlistParseError, table::TableError},
+    error::{message::MessageError, table::TableError},
     message_types::{
         app::AppMessage,
         app_store::AppStoreMessage,
@@ -11,17 +11,24 @@ use imessage_database::{
         handwriting::HandwrittenMessage,
         music::MusicMessage,
         placemark::PlacemarkMessage,
+        polls::Poll,
         text_effects::{Animation, Style, TextEffect, Unit},
         url::URLMessage,
     },
     tables::{
         attachment::Attachment,
-        messages::{models::AttachmentMeta, Message},
+        messages::{
+            Message,
+            models::{AttachmentMeta, TextAttributes},
+        },
     },
 };
 
 use crate::app::{error::RuntimeError, runtime::Config};
 
+pub(crate) const ATTACHMENT_NO_FILENAME: &str = "Attachment missing name metadata!";
+
+// MARK: Exporter
 /// Defines behavior for iterating over messages from the iMessage database and managing export files
 pub trait Exporter<'a> {
     /// Create a new exporter with references to the cached data
@@ -35,10 +42,13 @@ pub trait Exporter<'a> {
         &mut self,
         message: &Message,
     ) -> Result<&mut BufWriter<File>, RuntimeError>;
+    /// Write formatted text to a file
+    fn write_to_file(file: &mut BufWriter<File>, text: &str) -> Result<(), RuntimeError>;
 }
 
+// MARK: Message
 /// Defines behavior for formatting message instances to the desired output format
-pub(super) trait Writer<'a> {
+pub(super) trait MessageFormatter<'a> {
     /// Format a message, including its tapbacks and replies
     fn format_message(&self, msg: &Message, indent: usize) -> Result<String, TableError>;
     /// Format an attachment, possibly by reading the disk
@@ -56,7 +66,7 @@ pub(super) trait Writer<'a> {
         msg: &'a Message,
         attachments: &mut Vec<Attachment>,
         indent: &str,
-    ) -> Result<String, PlistParseError>;
+    ) -> Result<String, MessageError>;
     /// Format a tapback (displayed under a message)
     fn format_tapback(&self, msg: &Message) -> Result<String, TableError>;
     /// Format an expressive message
@@ -75,11 +85,11 @@ pub(super) trait Writer<'a> {
         message_part_idx: usize,
         indent: &str,
     ) -> Option<String>;
-    /// Format some attributed text
-    fn format_attributed(&'a self, text: &'a str, attribute: &'a TextEffect) -> Cow<'a, str>;
-    fn write_to_file(file: &mut BufWriter<File>, text: &str) -> Result<(), RuntimeError>;
+    /// Format all [`TextAttributes`]s applied to a given set of text
+    fn format_attributes(&'a self, text: &'a str, attributes: &'a [TextAttributes]) -> String;
 }
 
+// MARK: Balloon
 /// Defines behavior for formatting custom balloons to the desired output format
 pub(super) trait BalloonFormatter<T> {
     /// Format a URL message
@@ -106,6 +116,8 @@ pub(super) trait BalloonFormatter<T> {
     fn format_find_my(&self, balloon: &AppMessage, indent: T) -> String;
     /// Format a Check In message
     fn format_check_in(&self, balloon: &AppMessage, indent: T) -> String;
+    /// Format a Poll message
+    fn format_poll(&self, poll: &Poll, indent: T) -> String;
     /// Format a generic app, generally third party
     fn format_generic_app(
         &self,
@@ -116,7 +128,11 @@ pub(super) trait BalloonFormatter<T> {
     ) -> String;
 }
 
-pub(super) trait TextEffectFormatter {
+// MARK: Text Effects
+/// Defines behavior for applying a [`TextEffect`] to the desired output format
+pub(super) trait TextEffectFormatter<'a> {
+    /// Format a specific [`TextEffect`]
+    fn format_effect(&'a self, text: &'a str, effect: &'a TextEffect) -> Cow<'a, str>;
     /// Format message text containing a [`Mention`](imessage_database::message_types::text_effects::TextEffect::Mention)
     fn format_mention(&self, text: &str, mentioned: &str) -> String;
     /// Format message text containing a [`Link`](imessage_database::message_types::text_effects::TextEffect::Link)
